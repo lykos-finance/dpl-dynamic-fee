@@ -1,0 +1,14 @@
+# Секреты и ключи
+.env*
+.*key
+sepolia.txt
+
+# Артефакты сборки и кэш (Foundry / Hardhat)
+out/
+cache/
+output/
+broadcast/
+
+# Временные папки и инструменты
+.claude/
+trash/

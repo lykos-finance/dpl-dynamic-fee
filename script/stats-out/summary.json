@@ -1,0 +1,18 @@
+{
+  "hook": "0x5Dd65052B59cc01604C85EaffD9441d0BC371080",
+  "from_block": "25028397",
+  "to_block": "latest",
+  "chain_id": 1,
+  "generated_at": "2026-05-08T05:29:34.519268+00:00",
+  "panic_events": 0,
+  "expired_events": 0,
+  "pools_affected": 0,
+  "avg_tick_delta": 0.0,
+  "max_tick_delta": 0,
+  "avg_panic_duration_sec": 0.0,
+  "total_swaps": 1,
+  "calm_swaps": 1,
+  "panic_swaps": 0,
+  "panic_pct": 0.0,
+  "weighted_avg_fee_pct": 0.01
+}
