@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(wc -l \"/home/whoami/SlavaProjects/Uniswap v4/src\"/*.sol \"/home/whoami/SlavaProjects/Uniswap v4/test\"/*.sol)"
-    ]
-  }
-}
