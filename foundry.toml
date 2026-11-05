@@ -12,3 +12,36 @@ remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
     "solady/=lib/solady/src/"
 ]
+
+# Only VolatilityGuardHookV8 and its scripts: the other contracts have their own missing dependencies
+[profile.v8]
+skip = [
+    "script/Deploy(*",
+    "script/DeploySwap*",
+    "script/DeployArb*",
+    "script/DeployV5*",
+    "script/Increase*",
+    "script/InitPool(*",
+    "script/InitPoolNoHook*",
+    "script/InitPoolSwap*",
+    "script/InitPoolUSDC*",
+    "script/InitPoolV2*",
+    "script/Remove*",
+    "script/Withdraw*",
+    "script/arb/**",
+    "script/stats/**",
+    "src/dynamic-fee(slv-V3*",
+    "src/dynamic-fee(slv-V4*",
+    "src/dynamic-fee(slv-V5*",
+    "src/dynamic-fee(slv-V6*",
+    "src/dynamic-fee(slv-V7*",
+    "src/SwapLogger*",
+    "src/Arb*",
+    "src/Route*",
+    "src/Payout*",
+    "src/interfaces/**",
+    "test/VolatilityTest*",
+    "test/ZeroTest*",
+    "test/ArbExecutor*",
+    "test/mocks/**",
+]
