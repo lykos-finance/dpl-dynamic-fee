@@ -29,15 +29,15 @@
 
 ## Установка
 
-Нужен [Foundry](https://book.getfoundry.sh/getting-started/installation). Сабмодуль указывайте явно: `git submodule update --recursive` без пути падает на устаревшей ссылке `lib/openzeppelin-contracts`.
+Нужен [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```bash
-git clone -b <ветка> https://github.com/lykos-finance/lykos-contracts.git
-cd lykos-contracts
-git submodule update --init --recursive lib/v4-periphery
+git clone https://github.com/lykos-finance/dpl-dynamic-fee.git
+cd dpl-dynamic-fee
+git submodule update --init --recursive
 ```
 
-Все команды Foundry запускаются с профилем `v8`: остальные контракты репозитория в нём не собираются.
+Все команды Foundry запускаются с профилем `v8`.
 
 ```bash
 export FOUNDRY_PROFILE=v8
