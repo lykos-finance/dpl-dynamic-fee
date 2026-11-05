@@ -1,35 +1,35 @@
-# VolatilityGuardHookV8: запуск
+# VolatilityGuardHookV8: how to run
 
-Хук Uniswap v4 для пула USDC/WETH в Ethereum mainnet. Комиссия свопа зависит от волатильности и меняется от 0,01% до 2%. 10% комиссии сразу уходят на адрес казны, остальное получают LP.
+A Uniswap v4 hook for the USDC/WETH pool on Ethereum mainnet. The swap fee follows volatility and ranges from 0.01% to 2%. 10% of the fee goes straight to the treasury address, and LPs receive the rest.
 
-## Как работает
+## How it works
 
-| Отклонение цены от якоря | Комиссия |
+| Price deviation from the anchor | Fee |
 |---|---|
-| До 20 тиков (~0,2%) | 0,01% |
-| От 20 до 200 тиков | Линейный рост |
-| От 200 тиков (~2%) | 2% |
+| Up to 20 ticks (~0.2%) | 0.01% |
+| 20 to 200 ticks | Linear increase |
+| 200 ticks or more (~2%) | 2% |
 
-- Якорь догоняет текущий тик за счёт времени (`ANCHOR_PERIOD` = 300 секунд), а не числа свопов.
-- Своп платит комиссию и за собственный сдвиг цены, поэтому крупный своп сам получает высокую комиссию.
-- Все параметры комиссии заданы константами. После деплоя их нельзя изменить, понадобятся новый хук, новый пул и перенос ликвидности.
-- Паузы нет: никто не может остановить свопы.
-- Если Uniswap включит протокольную комиссию (до 0,1%), трейдер заплатит максимум 2,098%.
-- Если перевод казне не прошёл, своп всё равно выполняется, а доля остаётся в хуке. Её отправляет на адрес казны `sweepToTreasury(currency)`, которую может вызвать кто угодно.
+- The anchor catches up with the current tick based on time (`ANCHOR_PERIOD` = 300 seconds), not on the number of swaps.
+- A swap also pays for its own price impact, so a large swap gets a high fee itself.
+- All fee parameters are constants. They cannot be changed after deployment: that takes a new hook, a new pool and a liquidity migration.
+- There is no pause: nobody can stop swaps.
+- If Uniswap enables the protocol fee (up to 0.1%), a trader pays at most 2.098%.
+- If the transfer to the treasury fails, the swap still goes through and the share stays in the hook. `sweepToTreasury(currency)`, which anyone can call, sends it to the treasury address.
 
-## Файлы
+## Files
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| `src/dynamic-fee(slv-V8).sol` | Хук |
-| `script/DeployV8(slv).s.sol` | Деплой фабрики и хука |
-| `script/InitPoolV8(slv).s.sol` | Создание пула и первая позиция |
-| `test/VolatilityGuardHookV8.t.sol` | Юнит-тесты |
-| `test/VolatilityGuardHookV8Fork.t.sol` | Полный путь на форке mainnet |
+| `src/dynamic-fee(slv-V8).sol` | The hook |
+| `script/DeployV8(slv).s.sol` | Deploys the factory and the hook |
+| `script/InitPoolV8(slv).s.sol` | Creates the pool and the first position |
+| `test/VolatilityGuardHookV8.t.sol` | Unit tests |
+| `test/VolatilityGuardHookV8Fork.t.sol` | Full flow on a mainnet fork |
 
-## Установка
+## Installation
 
-Нужен [Foundry](https://book.getfoundry.sh/getting-started/installation).
+Requires [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```bash
 git clone https://github.com/lykos-finance/dpl-dynamic-fee.git
@@ -37,100 +37,100 @@ cd dpl-dynamic-fee
 git submodule update --init --recursive
 ```
 
-Все команды Foundry запускаются с профилем `v8`.
+Run all Foundry commands with the `v8` profile.
 
 ```bash
 export FOUNDRY_PROFILE=v8
 ```
 
-## Проверка
+## Testing
 
 ```bash
-# Юнит-тесты
+# Unit tests
 forge test --match-path test/VolatilityGuardHookV8.t.sol
 
-# Деплой, создание пула, своп и вывод на форке mainnet. В сеть ничего не отправляется
+# Deployment, pool creation, a swap and a withdrawal on a mainnet fork. Nothing is sent to the network
 forge test --match-path test/VolatilityGuardHookV8Fork.t.sol
 ```
 
-Форк-тест использует `MAINNET_RPC_URL`, а если переменной нет, то публичный RPC.
+The fork test uses `MAINNET_RPC_URL`, or a public RPC if the variable is not set.
 
-## Настройка `.env`
+## `.env` setup
 
-Файл `.env` не коммитится.
+The `.env` file is not committed.
 
 ```bash
-PRIVATE_KEY=0x...          # кошелёк деплоера, он же получатель 10% и владелец позиции
+PRIVATE_KEY=0x...          # deployer wallet, which also receives the 10% and owns the position
 MAINNET_RPC_URL=https://...
-SIGNER_A=0x...             # подписанты мультисига, разные адреса
+SIGNER_A=0x...             # multisig signers, two different addresses
 SIGNER_B=0x...
 
-# После деплоя хука
+# After deploying the hook
 HOOK_ADDRESS_V8=0x...
 
-# Необязательно
-LP_USDC_PER_SIDE=2500000   # USDC на сторону, 6 знаков. По умолчанию $2.50
-LP_RANGE_BELOW_PCT=50      # диапазон от текущей цены ETH, %
+# Optional
+LP_USDC_PER_SIDE=2500000   # USDC per side, 6 decimals. Defaults to $2.50
+LP_RANGE_BELOW_PCT=50      # range around the current ETH price, %
 LP_RANGE_ABOVE_PCT=50
 ```
 
-Адрес хука зависит от подписантов, поэтому выберите их до деплоя. На подписантов лучше назначить не адрес деплоера: иначе при утечке его ключа без второго подписанта адрес казны не сменить.
+The hook address depends on the signers, so choose them before deploying. Avoid using the deployer address as a signer: if its key leaks, the treasury address cannot be changed without the second signer.
 
-## Деплой
+## Deployment
 
-Без `--broadcast` команда только симулирует транзакции. Сначала всегда запускайте симуляцию.
+Without `--broadcast`, a command only simulates the transactions. Always run the simulation first.
 
 ```bash
 set -a; source .env; set +a
 
-# 1. Симуляция и деплой хука
+# 1. Simulate and deploy the hook
 forge script "script/DeployV8(slv).s.sol:DeployV8" --rpc-url "$MAINNET_RPC_URL"
 forge script "script/DeployV8(slv).s.sol:DeployV8" --rpc-url "$MAINNET_RPC_URL" --broadcast
 ```
 
-Запишите напечатанный адрес в `HOOK_ADDRESS_V8` в `.env`. На кошельке деплоера должны быть USDC и WETH (именно WETH, а не ETH).
+Save the printed address as `HOOK_ADDRESS_V8` in `.env`. The deployer wallet must hold USDC and WETH (WETH specifically, not ETH).
 
 ```bash
 set -a; source .env; set +a
 
-# 2. Симуляция и создание пула
+# 2. Simulate and create the pool
 forge script "script/InitPoolV8(slv).s.sol:InitPoolV8" --rpc-url "$MAINNET_RPC_URL"
 forge script "script/InitPoolV8(slv).s.sol:InitPoolV8" --rpc-url "$MAINNET_RPC_URL" --broadcast
 ```
 
-Скрипт берёт стартовую цену из Chainlink ETH/USD и создаёт пул вместе с первой позицией одной транзакцией. NFT-позиция приходит на кошелёк деплоера.
+The script takes the starting price from Chainlink ETH/USD and creates the pool together with the first position in one transaction. The position NFT goes to the deployer wallet.
 
-## Глубина ликвидности
+## Liquidity depth
 
-Комиссия зависит от сдвига цены самим свопом, поэтому при тонкой ликвидности почти все свопы платят много. На форке своп $1000 при $100 000 на сторону и диапазоне ±50% заплатил около 0,44%. С настройками по умолчанию ($2,50 на сторону) даже небольшой своп платит около 2%. Подберите объём и диапазон до запуска.
+The fee depends on how far a swap itself moves the price, so with thin liquidity almost every swap pays a lot. On a fork, a $1,000 swap with $100,000 per side and a ±50% range paid about 0.44%. With the default settings ($2.50 per side), even a small swap pays about 2%. Choose the amount and range before launch.
 
-## Вывод ликвидности
+## Withdrawing liquidity
 
-Мультисиг для вывода не нужен: NFT-позиция лежит на вашем кошельке, и вывести её может её владелец через `PositionManager`. Форк-тест проверяет такой вывод вызовом контракта. Отображение пула в интерфейсе Uniswap не проверялось.
+No multisig is needed: the position NFT sits in your wallet, and its owner can withdraw it through `PositionManager`. The fork test covers this withdrawal with a direct contract call. How the pool appears in the Uniswap interface has not been tested.
 
-## Смена адреса казны
+## Changing the treasury address
 
-Это единственное действие мультисига. Предлагает один подписант, подтверждает и исполняет второй, разными ключами.
+This is the multisig's only action. One signer proposes, and the other confirms and executes, using separate keys.
 
 ```bash
 HOOK=$HOOK_ADDRESS_V8
 NEW=0x...
 
-# Подписант 1: предложение
-cast send $HOOK "proposeSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <ключ подписанта 1>
+# Signer 1: propose
+cast send $HOOK "proposeSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 1 key>
 
-# Подписант 2, не позже 30 минут после предложения: подтверждение
-cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <ключ подписанта 2>
+# Signer 2, within 30 minutes of the proposal: confirm
+cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 2 key>
 
-# Подписант 2, через 15–45 минут после подтверждения: исполнение (та же функция)
-cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <ключ подписанта 2>
+# Signer 2, 15 to 45 minutes after confirming: execute (same function)
+cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 2 key>
 ```
 
-Если срок истёк, вызов вернёт `ProposalExpired`: создайте новое предложение.
+If a deadline passes, the call reverts with `ProposalExpired`: create a new proposal.
 
-## Ограничения
+## Limitations
 
-- Подписантов заменить нельзя. Без любого из них адрес казны больше не сменить, но на свопы и ликвидность это не влияет.
-- Один подписант может повторным предложением обнулить подтверждение и так мешать смене адреса.
-- Контракт не проходил внешний аудит, а пороги комиссии не проверены на истории рынка.
-- Деплой в mainnet из этих скриптов не выполнялся, проверены форк и тесты.
+- Signers cannot be replaced. Without either of them the treasury address can no longer be changed, but swaps and liquidity are not affected.
+- One signer can reset a confirmation by proposing again, and so block a treasury change.
+- The contract has not had an external audit, and the fee thresholds have not been tested against historical market data.
+- These scripts have not been used for a mainnet deployment. They have only been tested on a fork and in tests.
