@@ -4,18 +4,17 @@ pragma solidity ^0.8.26;
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
+import {Currency} from "v4-core/types/Currency.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 
 /// @title VolatilityGuardHookV8
-/// @notice Total swap fee scales linearly from 0.01% to 2% with the distance between the
-///         pool tick and a time-weighted anchor tick. Part of that fee goes to the treasury.
+/// @notice The swap fee scales linearly from 0.01% to 2% with the distance between the pool tick
+///         and a time-weighted anchor tick. 90% of it goes to the LPs and 10% back to the swapper.
 ///
 /// Fee model:
 ///   - deviation <= CALM_TICKS -> MIN_FEE, deviation >= FULL_TICKS -> MAX_FEE, linear in between
@@ -24,65 +23,42 @@ import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 ///   - the anchor follows the tick by time only, so splitting a move into many swaps
 ///     or sending dust swaps cannot move it faster or hold the fee up
 ///
-/// Fee split (TREASURY_BPS, 10%):
-///   - LPs receive the rest of the total fee, the treasury share is sent in the same swap
-///   - if that transfer fails the share stays in the hook as ERC-6909 claims, so swaps are never blocked
-///   - anyone can then push those claims to the treasury, they cannot go anywhere else
+/// Fee split:
+///   - LP_BPS (90%) is the pool's LP fee: it accrues in the positions and is paid out together
+///     with the liquidity when a position is decreased or closed, no separate claim is needed
+///   - SWAPPER_REBATE_BPS (10%) is charged and sent back to tx.origin in the same swap. If that
+///     transfer fails it is simply not charged, so a swap is never blocked by the rebate
+///   - the hook keeps nothing
 ///
 /// Limits:
-///   - all fee and anchor parameters are constants and cannot be changed by any role
-///   - a Uniswap protocol fee (max 0.1%), if governance enables it, is charged on top of MAX_FEE
-///
-/// Access model:
-///   2-of-2 signers with a 15 minute timelock, same pattern as ArbCaptureHook. Their only power is
-///   replacing the treasury: they cannot pause swaps, change fees or touch liquidity.
-///   Signers cannot be replaced.
-///   A proposal must be confirmed within CONFIRM_WINDOW and executed within EXECUTE_WINDOW
-///   after the timelock, otherwise it expires and has to be proposed again.
-contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
+///   - all fee and anchor parameters are constants
+///   - there is no owner, admin or multisig: nobody can change fees, pause swaps or touch liquidity
+///   - a Uniswap protocol fee (max 0.1%), if governance enables it, is charged on top
+contract VolatilityGuardHookV8 is IHooks {
     using PoolIdLibrary  for PoolKey;
     using StateLibrary   for IPoolManager;
     using LPFeeLibrary   for uint24;
-    using CurrencyLibrary for Currency;
 
     // Fee limits (pips, 1e6 = 100%)
 
     uint24  public constant MIN_FEE = 100;     // 0.01%
     uint24  public constant MAX_FEE = 20_000;  // 2.00%
 
-    uint256 public constant BPS_DENOMINATOR  = 10_000;
-    uint256 public constant PIPS_DENOMINATOR = 1_000_000;
-    uint256 public constant TREASURY_BPS     = 1_000;   // 10% of the total fee
+    uint256 public constant BPS_DENOMINATOR    = 10_000;
+    uint256 public constant PIPS_DENOMINATOR   = 1_000_000;
+    uint256 public constant LP_BPS             = 9_000; // 90% of the fee
+    uint256 public constant SWAPPER_REBATE_BPS = 1_000; // 10% of the fee, back to tx.origin
 
     uint256 public constant CALM_TICKS    = 20;    // ~0.2% price move
     uint256 public constant FULL_TICKS    = 200;   // ~2% price move
     uint256 public constant ANCHOR_PERIOD = 300;
 
-    /// @dev Transient slot: total fee charged in the current swap's beforeSwap
+    /// @dev Transient slot: fee computed in the current swap's beforeSwap
     uint256 private constant PRE_FEE_SLOT = 0x8220d9fd2a41b0490df757cb156304643f600ab795f335b730e9bf367dd5c8bc;
 
     // Immutable
 
     IPoolManager public immutable poolManager;
-
-    // Access control state
-
-    address public immutable signerA;
-    address public immutable signerB;
-    address public treasury;
-
-    // 2-of-2 multisig
-
-    struct PendingAction {
-        address proposer;
-        uint256 proposedAt;
-        uint256 confirmedAt; // 0 until both signers have confirmed
-    }
-
-    mapping(bytes32 => PendingAction) public pendingActions;
-    uint256 public constant TIMELOCK = 15 minutes;
-    uint256 public constant CONFIRM_WINDOW = 30 minutes;
-    uint256 public constant EXECUTE_WINDOW = 30 minutes;
 
     // Pool state
 
@@ -95,15 +71,9 @@ contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
 
     // Events
 
-    event FeeCharged(PoolId indexed poolId, uint24 totalFee, uint256 treasuryAmount, uint256 lpTopUpAmount);
-    event TreasurySwept(Currency indexed currency, address indexed treasury, uint256 amount);
-
-    event TreasuryChanged(address indexed oldTreasury, address indexed newTreasury);
-
-    error NotProposedYet();
-    error TimelockNotElapsed();
-    error AlreadyConfirmed();
-    error ProposalExpired();
+    /// @param totalFee fee of the swap in pips, before the rebate
+    event FeeCharged(PoolId indexed poolId, uint24 totalFee, uint256 rebateAmount, uint256 lpTopUpAmount);
+    event SwapperRebate(address indexed recipient, Currency indexed currency, uint256 amount);
 
     // Modifiers
 
@@ -112,72 +82,17 @@ contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
         _;
     }
 
-    modifier onlyMultisig() {
-        require(msg.sender == signerA || msg.sender == signerB, "not a signer");
-        _;
-    }
-
     // Constructor
 
-    constructor(IPoolManager _poolManager, address _signerA, address _signerB, address _treasury) {
-        require(_signerA != _signerB && _signerA != address(0) && _signerB != address(0), "bad signers");
-        require(_treasury != address(0), "zero treasury");
-
+    constructor(IPoolManager _poolManager) {
+        require(LP_BPS + SWAPPER_REBATE_BPS == BPS_DENOMINATOR, "bad split");
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
-
         poolManager = _poolManager;
-        signerA     = _signerA;
-        signerB     = _signerB;
-        treasury    = _treasury;
-    }
-
-    // Treasury
-
-    function proposeSetTreasury(address newTreasury) external onlyMultisig returns (bytes32) {
-        require(newTreasury != address(0), "zero address");
-        bytes32 actionHash = keccak256(abi.encode("setTreasury", newTreasury));
-        pendingActions[actionHash] = PendingAction(msg.sender, block.timestamp, 0);
-        return actionHash;
-    }
-
-    /// @notice First call by the other signer starts the timelock, a second call after it executes
-    function confirmAndExecuteSetTreasury(address newTreasury) external onlyMultisig {
-        bytes32 actionHash = keccak256(abi.encode("setTreasury", newTreasury));
-        PendingAction storage action = pendingActions[actionHash];
-        if (action.proposer == address(0)) revert NotProposedYet();
-        if (action.proposer == msg.sender) revert AlreadyConfirmed();
-
-        if (action.confirmedAt == 0) {
-            if (block.timestamp > action.proposedAt + CONFIRM_WINDOW) revert ProposalExpired();
-            action.confirmedAt = block.timestamp;
-            return;
-        }
-        if (block.timestamp < action.confirmedAt + TIMELOCK) revert TimelockNotElapsed();
-        if (block.timestamp > action.confirmedAt + TIMELOCK + EXECUTE_WINDOW) revert ProposalExpired();
-
-        emit TreasuryChanged(treasury, newTreasury);
-        treasury = newTreasury;
-        delete pendingActions[actionHash];
-    }
-
-    /// @notice Sends a treasury share that failed to transfer during a swap. Callable by anyone.
-    function sweepToTreasury(Currency currency) external {
-        uint256 amount = poolManager.balanceOf(address(this), currency.toId());
-        if (amount == 0) return;
-        poolManager.unlock(abi.encode(currency, amount));
-        emit TreasurySwept(currency, treasury, amount);
-    }
-
-    function unlockCallback(bytes calldata data) external override onlyPoolManager returns (bytes memory) {
-        (Currency currency, uint256 amount) = abi.decode(data, (Currency, uint256));
-        poolManager.burn(address(this), currency.toId(), amount);
-        poolManager.take(currency, treasury, amount);
-        return "";
     }
 
     // View helpers
 
-    /// @notice Total fee (pips) for a given distance from the anchor. Always within [MIN_FEE, MAX_FEE].
+    /// @notice Fee (pips) for a given distance from the anchor. Always within [MIN_FEE, MAX_FEE].
     function feeForDeviation(uint256 deviation) public pure returns (uint24) {
         if (deviation <= CALM_TICKS) return MIN_FEE;
         if (deviation >= FULL_TICKS) return MAX_FEE;
@@ -275,17 +190,8 @@ contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
         int128 unspecified = specifiedIsZero ? delta.amount1() : delta.amount0();
         uint256 base = uint256(uint128(unspecified < 0 ? -unspecified : unspecified));
 
-        uint256 treasuryAmount = (base * (totalFee - _lpShare(totalFee))) / PIPS_DENOMINATOR;
-        uint256 topUpAmount    = (base * (_lpShare(totalFee) - _lpShare(preFee))) / PIPS_DENOMINATOR;
-
-        // Donating to a pool with no active liquidity reverts
-        if (topUpAmount != 0 && poolManager.getLiquidity(poolId) == 0) topUpAmount = 0;
-
-        _collect(key, specifiedIsZero, treasuryAmount, topUpAmount);
-
-        emit FeeCharged(poolId, totalFee, treasuryAmount, topUpAmount);
-
-        return (IHooks.afterSwap.selector, int128(int256(treasuryAmount + topUpAmount)));
+        uint256 charged = _distribute(key, specifiedIsZero, base, totalFee, preFee);
+        return (IHooks.afterSwap.selector, int128(int256(charged)));
     }
 
     // Internal
@@ -313,18 +219,36 @@ contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
         return postFee > preFee ? postFee : preFee;
     }
 
-    function _collect(PoolKey calldata key, bool specifiedIsZero, uint256 treasuryAmount, uint256 topUpAmount) internal {
+    /// @dev Takes the rebate and the LP top-up from the unspecified currency, returns the amount charged
+    function _distribute(PoolKey calldata key, bool specifiedIsZero, uint256 base, uint24 totalFee, uint24 preFee)
+        internal
+        returns (uint256)
+    {
+        PoolId poolId = key.toId();
         Currency currency = specifiedIsZero ? key.currency1 : key.currency0;
-        if (treasuryAmount != 0) {
-            try poolManager.take(currency, treasury, treasuryAmount) {} catch {
-                poolManager.mint(address(this), currency.toId(), treasuryAmount);
-            }
-        }
+
+        uint256 rebateAmount = (base * _share(totalFee, SWAPPER_REBATE_BPS)) / PIPS_DENOMINATOR;
+        uint256 topUpAmount  = (base * (_lpShare(totalFee) - _lpShare(preFee))) / PIPS_DENOMINATOR;
+
+        // Donating to a pool with no active liquidity reverts
+        if (topUpAmount != 0 && poolManager.getLiquidity(poolId) == 0) topUpAmount = 0;
+
         if (topUpAmount != 0) {
             specifiedIsZero
                 ? poolManager.donate(key, 0, topUpAmount, "")
                 : poolManager.donate(key, topUpAmount, 0, "");
         }
+        // Last, after all state changes: this call can run code at tx.origin
+        if (rebateAmount != 0) {
+            try poolManager.take(currency, tx.origin, rebateAmount) {
+                emit SwapperRebate(tx.origin, currency, rebateAmount);
+            } catch {
+                rebateAmount = 0; // not charged, the swapper keeps it
+            }
+        }
+
+        emit FeeCharged(poolId, totalFee, rebateAmount, topUpAmount);
+        return rebateAmount + topUpAmount;
     }
 
     function _deviation(int24 tick, int24 anchor) internal pure returns (uint256) {
@@ -333,7 +257,11 @@ contract VolatilityGuardHookV8 is IHooks, IUnlockCallback {
     }
 
     function _lpShare(uint24 fee) internal pure returns (uint24) {
-        return fee - uint24((uint256(fee) * TREASURY_BPS) / BPS_DENOMINATOR);
+        return _share(fee, LP_BPS);
+    }
+
+    function _share(uint24 fee, uint256 bps) internal pure returns (uint24) {
+        return uint24((uint256(fee) * bps) / BPS_DENOMINATOR);
     }
 
     // IHooks stubs

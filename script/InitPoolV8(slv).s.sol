@@ -73,7 +73,7 @@ contract InitPoolV8 is Script {
         require(block.chainid == 1, "Wrong chain - need Ethereum mainnet");
         require(hook.code.length != 0, "HOOK_ADDRESS_V8 has no code");
         require(
-            address(VolatilityGuardHookV8(payable(hook)).poolManager()) == POOL_MANAGER, "Hook uses another PoolManager"
+            address(VolatilityGuardHookV8(hook).poolManager()) == POOL_MANAGER, "Hook uses another PoolManager"
         );
 
         console.log("=== InitPoolV8 ===");
