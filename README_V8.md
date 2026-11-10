@@ -1,21 +1,22 @@
 # VolatilityGuardHookV8: how to run
 
-A Uniswap v4 hook for the USDC/WETH pool on Ethereum mainnet. The swap fee follows volatility and ranges from 0.01% to 2%. 10% of the fee goes straight to the treasury address, and LPs receive the rest.
+A Uniswap v4 hook for the USDC/WETH pool on Ethereum mainnet. The swap fee follows volatility and ranges from 0.01% to 2%. 90% of it goes to LPs and 10% is sent back to the swapper (`tx.origin`) in the same transaction. The hook keeps nothing and has no owner, admin or treasury.
 
 ## How it works
 
-| Price deviation from the anchor | Fee |
-|---|---|
-| Up to 20 ticks (~0.2%) | 0.01% |
-| 20 to 200 ticks | Linear increase |
-| 200 ticks or more (~2%) | 2% |
+| Price deviation from the anchor | Charged | LPs | Rebate to `tx.origin` | Swapper's net cost |
+|---|---|---|---|---|
+| Up to 20 ticks (~0.2%) | 0.01% | 0.009% | 0.001% | 0.009% |
+| 20 to 200 ticks | Linear increase | 90% of it | 10% of it | 90% of it |
+| 200 ticks or more (~2%) | 2% | 1.8% | 0.2% | 1.8% |
 
 - The anchor catches up with the current tick based on time (`ANCHOR_PERIOD` = 300 seconds), not on the number of swaps.
 - A swap also pays for its own price impact, so a large swap gets a high fee itself.
 - All fee parameters are constants. They cannot be changed after deployment: that takes a new hook, a new pool and a liquidity migration.
-- There is no pause: nobody can stop swaps.
-- If Uniswap enables the protocol fee (up to 0.1%), a trader pays at most 2.098%.
-- If the transfer to the treasury fails, the swap still goes through and the share stays in the hook. `sweepToTreasury(currency)`, which anyone can call, sends it to the treasury address.
+- Nobody has any rights over the hook: there is no pause, no fee change and no access to liquidity.
+- Every LP, including the deployer, is paid by the same rules: the LP share is split pro rata to the liquidity that is in range at the time of the swap. Fees accrue in the position and are paid out automatically, together with the liquidity, when the position is decreased or closed. No separate claim is needed.
+- If Uniswap enables the protocol fee (up to 0.1%), it is charged on top.
+- The rebate is paid in the unspecified token of the swap (the output token for an exact-input swap) to `tx.origin`, not to the router. With a smart wallet, a relayer or a solver, `tx.origin` is whoever sent the transaction, so they get the rebate. Arbitrage bots get it too. Router slippage checks see the full fee, since the rebate arrives as a separate transfer. If the transfer to `tx.origin` fails, the rebate is simply not charged and the swap still goes through.
 
 ## Files
 
@@ -60,10 +61,8 @@ The fork test uses `MAINNET_RPC_URL`, or a public RPC if the variable is not set
 The `.env` file is not committed.
 
 ```bash
-PRIVATE_KEY=0x...          # deployer wallet, which also receives the 10% and owns the position
+PRIVATE_KEY=0x...          # deployer wallet, owns the first position
 MAINNET_RPC_URL=https://...
-SIGNER_A=0x...             # multisig signers, two different addresses
-SIGNER_B=0x...
 
 # After deploying the hook
 HOOK_ADDRESS_V8=0x...
@@ -73,8 +72,6 @@ LP_USDC_PER_SIDE=2500000   # USDC per side, 6 decimals. Defaults to $2.50
 LP_RANGE_BELOW_PCT=50      # range around the current ETH price, %
 LP_RANGE_ABOVE_PCT=50
 ```
-
-The hook address depends on the signers, so choose them before deploying. Avoid using the deployer address as a signer: if its key leaks, the treasury address cannot be changed without the second signer.
 
 ## Deployment
 
@@ -102,35 +99,14 @@ The script takes the starting price from Chainlink ETH/USD and creates the pool 
 
 ## Liquidity depth
 
-The fee depends on how far a swap itself moves the price, so with thin liquidity almost every swap pays a lot. On a fork, a $1,000 swap with $100,000 per side and a ±50% range paid about 0.44%. With the default settings ($2.50 per side), even a small swap pays about 2%. Choose the amount and range before launch.
+The fee depends on how far a swap itself moves the price, so with thin liquidity almost every swap pays a lot. On a fork, a $1,000 swap with $100,000 per side and a ±50% range paid about 0.44% before the fee split was changed. It has not been measured since. With the default settings ($2.50 per side), even a small swap is charged about 2% and gets 0.2% back. Choose the amount and range before launch.
 
 ## Withdrawing liquidity
 
-No multisig is needed: the position NFT sits in your wallet, and its owner can withdraw it through `PositionManager`. The fork test covers this withdrawal with a direct contract call. How the pool appears in the Uniswap interface has not been tested.
-
-## Changing the treasury address
-
-This is the multisig's only action. One signer proposes, and the other confirms and executes, using separate keys.
-
-```bash
-HOOK=$HOOK_ADDRESS_V8
-NEW=0x...
-
-# Signer 1: propose
-cast send $HOOK "proposeSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 1 key>
-
-# Signer 2, within 30 minutes of the proposal: confirm
-cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 2 key>
-
-# Signer 2, 15 to 45 minutes after confirming: execute (same function)
-cast send $HOOK "confirmAndExecuteSetTreasury(address)" $NEW --rpc-url "$MAINNET_RPC_URL" --private-key <signer 2 key>
-```
-
-If a deadline passes, the call reverts with `ProposalExpired`: create a new proposal.
+The position NFT sits in your wallet, and its owner can withdraw it through `PositionManager`. The accrued LP fees are paid in the same transaction. The fork test covers this withdrawal with a direct contract call. How the pool appears in the Uniswap interface has not been tested.
 
 ## Limitations
 
-- Signers cannot be replaced. Without either of them the treasury address can no longer be changed, but swaps and liquidity are not affected.
-- One signer can reset a confirmation by proposing again, and so block a treasury change.
+- Nothing can be fixed after deployment: a bug or a bad fee threshold means a new hook, a new pool and moving the liquidity.
 - The contract has not had an external audit, and the fee thresholds have not been tested against historical market data.
 - These scripts have not been used for a mainnet deployment. They have only been tested on a fork and in tests.

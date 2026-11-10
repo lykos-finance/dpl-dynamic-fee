@@ -44,11 +44,9 @@ contract VolatilityGuardHookV8ForkTest is Test {
     function test_fullFlow() public {
         vm.createSelectFork(vm.envOr("MAINNET_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
         vm.setEnv("PRIVATE_KEY", vm.toString(bytes32(TEST_PK)));
-        vm.setEnv("SIGNER_A", vm.toString(address(0xA1)));
-        vm.setEnv("SIGNER_B", vm.toString(address(0xA2)));
 
         address hook = _deployHook();
-        assertEq(VolatilityGuardHookV8(payable(hook)).treasury(), deployer);
+        assertEq(address(VolatilityGuardHookV8(hook).poolManager()), POOL_MANAGER);
 
         vm.setEnv("HOOK_ADDRESS_V8", vm.toString(hook));
         vm.setEnv("LP_USDC_PER_SIDE", "100000000000"); // $100k per side
@@ -63,7 +61,7 @@ contract VolatilityGuardHookV8ForkTest is Test {
 
         PoolKey memory key = PoolKey(Currency.wrap(USDC), Currency.wrap(WETH), 0x800000, 60, IHooks(hook));
         _assertPoolPriceMatchesChainlink(key);
-        _swapPaysTreasury(key);
+        _swapPaysRebate(key, hook);
         _deployerWithdrawsAlone(key, tokenId);
 
         InitPoolV8 again = new InitPoolV8();
@@ -90,13 +88,12 @@ contract VolatilityGuardHookV8ForkTest is Test {
         assertApproxEqRel(poolUsd8, uint256(answer), 1e15); // 0.1%
     }
 
-    function _swapPaysTreasury(PoolKey memory key) internal {
+    function _swapPaysRebate(PoolKey memory key, address hook) internal {
         PoolSwapTest router = new PoolSwapTest(IPoolManager(POOL_MANAGER));
         address trader = makeAddr("trader");
         deal(USDC, trader, 10_000e6);
-        uint256 treasuryBefore = IERC20Min(WETH).balanceOf(deployer);
 
-        vm.startPrank(trader);
+        vm.startPrank(trader, trader); // trader is also tx.origin
         IERC20Min(USDC).approve(address(router), type(uint256).max);
         router.swap(
             key,
@@ -106,7 +103,8 @@ contract VolatilityGuardHookV8ForkTest is Test {
         );
         vm.stopPrank();
 
-        assertGt(IERC20Min(WETH).balanceOf(deployer), treasuryBefore);
+        assertGt(IERC20Min(WETH).balanceOf(trader), 0, "rebate in WETH to tx.origin");
+        assertEq(IERC20Min(WETH).balanceOf(hook) + IERC20Min(USDC).balanceOf(hook), 0, "hook keeps nothing");
     }
 
     function _deployerWithdrawsAlone(PoolKey memory key, uint256 tokenId) internal {

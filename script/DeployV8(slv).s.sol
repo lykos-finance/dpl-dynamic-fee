@@ -21,7 +21,7 @@ contract HookFactoryV8 {
     }
 }
 
-/// @notice Deploy VolatilityGuardHookV8 on Ethereum mainnet. The treasury share goes to the deployer.
+/// @notice Deploy VolatilityGuardHookV8 on Ethereum mainnet. The hook has no owner and no constructor roles.
 contract DeployV8 is Script {
     address constant POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
 
@@ -29,19 +29,10 @@ contract DeployV8 is Script {
         uint256 pk       = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(pk);
 
-        // ── Подписанты берутся из .env ──
-        address signerA = vm.envAddress("SIGNER_A");
-        address signerB = vm.envAddress("SIGNER_B");
-
         require(block.chainid == 1, "Wrong chain - need Ethereum mainnet");
-        require(signerA != address(0) && signerB != address(0), "SIGNER_A / SIGNER_B not set");
-        require(signerA != signerB, "signers must differ");
 
         console.log("=== DeployV8 ===");
         console.log("Deployer:    ", deployer);
-        console.log("Treasury:    ", deployer);
-        console.log("Signer A:    ", signerA);
-        console.log("Signer B:    ", signerB);
         console.log("PoolManager: ", POOL_MANAGER);
         console.log("Chain ID:    ", block.chainid);
 
@@ -56,7 +47,7 @@ contract DeployV8 is Script {
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG
                 | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
-        bytes memory args = abi.encode(POOL_MANAGER, signerA, signerB, deployer);
+        bytes memory args = abi.encode(POOL_MANAGER);
         (address predicted, bytes32 salt) =
             HookMiner.find(address(factory), flags, type(VolatilityGuardHookV8).creationCode, args);
         console.log("Predicted hook:", predicted);
@@ -68,7 +59,7 @@ contract DeployV8 is Script {
         address hook = factory.deploy(abi.encodePacked(type(VolatilityGuardHookV8).creationCode, args), salt);
         vm.stopBroadcast();
         require(hook == predicted, "Hook addr mismatch");
-        require(VolatilityGuardHookV8(payable(hook)).treasury() == deployer, "Treasury mismatch");
+        require(address(VolatilityGuardHookV8(hook).poolManager()) == POOL_MANAGER, "PoolManager mismatch");
         console.log("Hook:          ", hook);
 
         console.log("\nAdd to .env:");
