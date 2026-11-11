@@ -7,7 +7,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {Currency} from "v4-core/types/Currency.sol";
+import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
@@ -32,12 +32,11 @@ interface IERC20Like {
     function approve(address spender, uint256 amount) external returns (bool);
 }
 
-/// @notice Creates the USDC/WETH pool with VolatilityGuardHookV8 on Ethereum mainnet and mints the
-///         first LP position to the deployer. Both happen in one transaction, so nobody can move
+/// @notice Creates the native ETH/USDC pool with VolatilityGuardHookV8 on Ethereum mainnet and mints
+///         the first LP position to the deployer. Both happen in one transaction, so nobody can move
 ///         the price of the empty pool in between.
 ///
-/// USDC < WETH по адресу → USDC = token0, WETH = token1, поэтому более высокой цене ETH
-/// соответствует меньший тик.
+/// Native ETH is always currency0 and USDC currency1, so a higher ETH price is a higher tick.
 contract InitPoolV8 is Script {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -46,7 +45,6 @@ contract InitPoolV8 is Script {
     address constant POOL_MANAGER      = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address constant POSITION_MANAGER  = 0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e;
     address constant PERMIT2           = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
-    address constant WETH              = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant USDC              = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address constant CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
@@ -61,8 +59,8 @@ contract InitPoolV8 is Script {
         int24   tickUpper;
         uint160 startSqrtPrice;
         uint128 liquidity;
-        uint256 amount0Max;
-        uint256 amount1Max;
+        uint256 ethMax;
+        uint256 usdcMax;
     }
 
     function run() public {
@@ -72,33 +70,31 @@ contract InitPoolV8 is Script {
 
         require(block.chainid == 1, "Wrong chain - need Ethereum mainnet");
         require(hook.code.length != 0, "HOOK_ADDRESS_V8 has no code");
-        require(
-            address(VolatilityGuardHookV8(hook).poolManager()) == POOL_MANAGER, "Hook uses another PoolManager"
-        );
+        require(address(VolatilityGuardHookV8(hook).poolManager()) == POOL_MANAGER, "Hook uses another PoolManager");
 
         console.log("=== InitPoolV8 ===");
         console.log("Deployer:", deployer);
         console.log("Hook:    ", hook);
 
-        Position memory position = _planPosition();
-        console.log("USDC max (6 dec):", position.amount0Max);
-        console.log("WETH max (wei):  ", position.amount1Max);
-        require(IERC20Like(USDC).balanceOf(deployer) >= position.amount0Max, "Not enough USDC");
-        require(IERC20Like(WETH).balanceOf(deployer) >= position.amount1Max, "Not enough WETH");
-
         PoolKey memory key = PoolKey(
-            Currency.wrap(USDC), Currency.wrap(WETH), LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, IHooks(hook)
+            CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(USDC), LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, IHooks(hook)
         );
         (uint160 existingPrice,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
         require(existingPrice == 0, "Pool already initialized");
+
+        Position memory position = _planPosition();
+        console.log("ETH max (wei):    ", position.ethMax);
+        console.log("USDC max (6 dec): ", position.usdcMax);
+        require(deployer.balance >= position.ethMax, "Not enough ETH");
+        require(IERC20Like(USDC).balanceOf(deployer) >= position.usdcMax, "Not enough USDC");
 
         bytes[] memory calls = _initAndMintCalls(key, position, deployer);
         uint256 tokenId = IPositionManager(POSITION_MANAGER).nextTokenId();
 
         vm.startBroadcast(pk);
         _approve(USDC);
-        _approve(WETH);
-        IMulticall_v4(POSITION_MANAGER).multicall(calls);
+        // Unused ETH is swept back to the deployer in the same call
+        IMulticall_v4(POSITION_MANAGER).multicall{value: position.ethMax}(calls);
         vm.stopBroadcast();
 
         console.log("\n=== DONE ===");
@@ -123,26 +119,23 @@ contract InitPoolV8 is Script {
         console.log("ETH price (USD * 1e8):", ethUsd8);
 
         p.startSqrtPrice = _sqrtPriceFromUsd8(ethUsd8);
-        p.tickLower = _floorToSpacing(
-            TickMath.getTickAtSqrtPrice(_sqrtPriceFromUsd8(ethUsd8 * (100 + rangeAbove) / 100))
-        );
-        p.tickUpper = _floorToSpacing(
-            TickMath.getTickAtSqrtPrice(_sqrtPriceFromUsd8(ethUsd8 * (100 - rangeBelow) / 100))
-        ) + TICK_SPACING;
+        p.tickLower = _floorToSpacing(TickMath.getTickAtSqrtPrice(_sqrtPriceFromUsd8(ethUsd8 * (100 - rangeBelow) / 100)));
+        p.tickUpper = _floorToSpacing(TickMath.getTickAtSqrtPrice(_sqrtPriceFromUsd8(ethUsd8 * (100 + rangeAbove) / 100)))
+            + TICK_SPACING;
 
-        uint256 wethAmount = (usdcAmount * 1e20) / ethUsd8;
+        uint256 ethAmount = (usdcAmount * 1e20) / ethUsd8;
         p.liquidity = LiquidityAmounts.getLiquidityForAmounts(
             p.startSqrtPrice,
             TickMath.getSqrtPriceAtTick(p.tickLower),
             TickMath.getSqrtPriceAtTick(p.tickUpper),
-            usdcAmount,
-            wethAmount
+            ethAmount,
+            usdcAmount
         );
         require(p.liquidity > 0, "Zero liquidity");
 
         // The position takes at most the target amounts, 1% covers rounding
-        p.amount0Max = (usdcAmount * 101) / 100 + 1;
-        p.amount1Max = (wethAmount * 101) / 100 + 1;
+        p.ethMax  = (ethAmount * 101) / 100 + 1;
+        p.usdcMax = (usdcAmount * 101) / 100 + 1;
     }
 
     function _initAndMintCalls(PoolKey memory key, Position memory p, address recipient)
@@ -151,14 +144,14 @@ contract InitPoolV8 is Script {
         returns (bytes[] memory calls)
     {
         bytes memory actions = abi.encodePacked(
-            uint8(Actions.MINT_POSITION), uint8(Actions.CLOSE_CURRENCY), uint8(Actions.CLOSE_CURRENCY)
+            uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP)
         );
         bytes[] memory params = new bytes[](3);
         params[0] = abi.encode(
-            key, p.tickLower, p.tickUpper, uint256(p.liquidity), uint128(p.amount0Max), uint128(p.amount1Max), recipient, bytes("")
+            key, p.tickLower, p.tickUpper, uint256(p.liquidity), uint128(p.ethMax), uint128(p.usdcMax), recipient, bytes("")
         );
-        params[1] = abi.encode(key.currency0);
-        params[2] = abi.encode(key.currency1);
+        params[1] = abi.encode(key.currency0, key.currency1);
+        params[2] = abi.encode(key.currency0, recipient);
 
         calls = new bytes[](2);
         calls[0] = abi.encodeCall(IPoolInitializer_v4.initializePool, (key, p.startSqrtPrice));
@@ -173,9 +166,9 @@ contract InitPoolV8 is Script {
         IAllowanceTransfer(PERMIT2).approve(token, POSITION_MANAGER, type(uint160).max, type(uint48).max);
     }
 
-    /// @dev price = WETH wei / USDC units = 1e12 / P = 1e20 / usd8, sqrtPriceX96 = sqrt(price * 2^192)
+    /// @dev price = USDC units / ETH wei = P * 1e6 / 1e18 = usd8 / 1e20, sqrtPriceX96 = sqrt(price * 2^192)
     function _sqrtPriceFromUsd8(uint256 usd8) internal pure returns (uint160) {
-        return uint160(_sqrt(FullMath.mulDiv(1e20, 1 << 192, usd8)));
+        return uint160(_sqrt(FullMath.mulDiv(usd8, 1 << 192, 1e20)));
     }
 
     function _floorToSpacing(int24 tick) internal pure returns (int24) {
