@@ -21,18 +21,23 @@ contract HookFactoryV8 {
     }
 }
 
-/// @notice Deploy VolatilityGuardHookV8 on Ethereum mainnet. The hook has no owner and no constructor roles.
+/// @notice Deploy VolatilityGuardHookV8 on Ethereum mainnet. TREASURY defaults to the deployer and
+///         can never be changed after deployment.
 contract DeployV8 is Script {
-    address constant POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
+    address constant POOL_MANAGER      = 0x000000000004444c5dc75cB358380D2e3dE08A90;
+    address constant CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
     function run() external {
         uint256 pk       = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(pk);
+        address treasury = vm.envOr("TREASURY", deployer);
 
         require(block.chainid == 1, "Wrong chain - need Ethereum mainnet");
+        require(treasury != address(0), "zero treasury");
 
         console.log("=== DeployV8 ===");
         console.log("Deployer:    ", deployer);
+        console.log("Treasury:    ", treasury);
         console.log("PoolManager: ", POOL_MANAGER);
         console.log("Chain ID:    ", block.chainid);
 
@@ -45,9 +50,9 @@ contract DeployV8 is Script {
         // ── 2. Mine salt ──
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG
-                | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
-        bytes memory args = abi.encode(POOL_MANAGER);
+        bytes memory args = abi.encode(POOL_MANAGER, treasury, CHAINLINK_ETH_USD);
         (address predicted, bytes32 salt) =
             HookMiner.find(address(factory), flags, type(VolatilityGuardHookV8).creationCode, args);
         console.log("Predicted hook:", predicted);
@@ -59,8 +64,9 @@ contract DeployV8 is Script {
         address hook = factory.deploy(abi.encodePacked(type(VolatilityGuardHookV8).creationCode, args), salt);
         vm.stopBroadcast();
         require(hook == predicted, "Hook addr mismatch");
-        require(address(VolatilityGuardHookV8(hook).poolManager()) == POOL_MANAGER, "PoolManager mismatch");
+        require(VolatilityGuardHookV8(hook).treasury() == treasury, "Treasury mismatch");
         console.log("Hook:          ", hook);
+        console.log("Payout threshold (wei):", VolatilityGuardHookV8(hook).payoutThreshold());
 
         console.log("\nAdd to .env:");
         console.log(string.concat("HOOK_ADDRESS_V8=", vm.toString(hook)));

@@ -7,14 +7,18 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {Currency} from "v4-core/types/Currency.sol";
+import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
+import {CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 
+interface IPriceFeed {
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
+}
+
 /// @title VolatilityGuardHookV8
 /// @notice The swap fee scales linearly from 0.01% to 2% with the distance between the pool tick
-///         and a time-weighted anchor tick. 90% of it goes to the LPs and 10% back to the swapper.
+///         and a time-weighted anchor tick. 90% of it goes to the pool's LPs, 10% to the treasury.
 ///
 /// Fee model:
 ///   - deviation <= CALM_TICKS -> MIN_FEE, deviation >= FULL_TICKS -> MAX_FEE, linear in between
@@ -23,35 +27,48 @@ import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 ///   - the anchor follows the tick by time only, so splitting a move into many swaps
 ///     or sending dust swaps cannot move it faster or hold the fee up
 ///
+/// Pools: any dynamic-fee pool whose currency0 is native ETH can use the hook, so the treasury
+/// share is always taken in ETH.
+///
 /// Fee split:
 ///   - LP_BPS (90%) is the pool's LP fee: it accrues in the positions and is paid out together
-///     with the liquidity when a position is decreased or closed, no separate claim is needed
-///   - SWAPPER_REBATE_BPS (10%) is charged and sent back to tx.origin in the same swap. If that
-///     transfer fails it is simply not charged, so a swap is never blocked by the rebate
-///   - the hook keeps nothing
+///     with the liquidity when a position is decreased or closed
+///   - TREASURY_BPS (10%) is taken in ETH and accrues in the hook as ERC-6909 claims of all pools
+///     together. Once the claims exceed PAYOUT_USD worth of ETH they are sent to the treasury in
+///     the same swap. The threshold in ETH is refreshed from Chainlink at each payout
+///   - when ETH is the specified side of a swap, the treasury share can only be taken in beforeSwap,
+///     at the pre-swap fee. The top-up for the swap's own price move then comes in the other token
+///     and goes to the LPs in full
 ///
 /// Limits:
-///   - all fee and anchor parameters are constants
-///   - there is no owner, admin or multisig: nobody can change fees, pause swaps or touch liquidity
+///   - all fee parameters and the treasury address are fixed at deployment
+///   - there is no owner or admin: nobody can change fees, pause swaps or touch liquidity
+///   - a treasury that cannot receive ETH never blocks swaps, the claims just keep accruing
 ///   - a Uniswap protocol fee (max 0.1%), if governance enables it, is charged on top
-contract VolatilityGuardHookV8 is IHooks {
-    using PoolIdLibrary  for PoolKey;
-    using StateLibrary   for IPoolManager;
-    using LPFeeLibrary   for uint24;
+contract VolatilityGuardHookV8 {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary  for IPoolManager;
+    using LPFeeLibrary  for uint24;
 
     // Fee limits (pips, 1e6 = 100%)
 
     uint24  public constant MIN_FEE = 100;     // 0.01%
     uint24  public constant MAX_FEE = 20_000;  // 2.00%
 
-    uint256 public constant BPS_DENOMINATOR    = 10_000;
-    uint256 public constant PIPS_DENOMINATOR   = 1_000_000;
-    uint256 public constant LP_BPS             = 9_000; // 90% of the fee
-    uint256 public constant SWAPPER_REBATE_BPS = 1_000; // 10% of the fee, back to tx.origin
+    uint256 public constant BPS_DENOMINATOR  = 10_000;
+    uint256 public constant PIPS_DENOMINATOR = 1_000_000;
+    uint256 public constant LP_BPS           = 9_000; // 90% of the fee
+    uint256 public constant TREASURY_BPS     = 1_000; // 10% of the fee, in ETH
 
     uint256 public constant CALM_TICKS    = 20;    // ~0.2% price move
     uint256 public constant FULL_TICKS    = 200;   // ~2% price move
     uint256 public constant ANCHOR_PERIOD = 300;
+
+    /// @notice Minimum accrued treasury share for a payout, USD with the feed's 8 decimals
+    uint256 public constant PAYOUT_USD = 100e8;
+
+    /// @dev ERC-6909 id of native ETH in the PoolManager
+    uint256 private constant ETH_ID = 0;
 
     /// @dev Transient slot: fee computed in the current swap's beforeSwap
     uint256 private constant PRE_FEE_SLOT = 0x8220d9fd2a41b0490df757cb156304643f600ab795f335b730e9bf367dd5c8bc;
@@ -59,8 +76,10 @@ contract VolatilityGuardHookV8 is IHooks {
     // Immutable
 
     IPoolManager public immutable poolManager;
+    address      public immutable treasury;
+    IPriceFeed   public immutable ethUsdFeed;
 
-    // Pool state
+    // State
 
     struct PoolState {
         int24  anchorTick;
@@ -69,41 +88,58 @@ contract VolatilityGuardHookV8 is IHooks {
 
     mapping(PoolId => PoolState) internal _states;
 
-    // Events
+    /// @notice Accrued ETH (wei) above which the next swap pays the treasury
+    uint256 public payoutThreshold;
 
-    /// @param totalFee fee of the swap in pips, before the rebate
-    event FeeCharged(PoolId indexed poolId, uint24 totalFee, uint256 rebateAmount, uint256 lpTopUpAmount);
-    event SwapperRebate(address indexed recipient, Currency indexed currency, uint256 amount);
+    event TreasuryPaid(uint256 amount, uint256 nextThreshold);
 
-    // Modifiers
+    error NotPoolManager();
+    error UnsupportedPool();
+    error BadConfig();
 
     modifier onlyPoolManager() {
-        require(msg.sender == address(poolManager), "not PoolManager");
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
         _;
     }
 
-    // Constructor
+    constructor(IPoolManager _poolManager, address _treasury, IPriceFeed _ethUsdFeed) {
+        if (_treasury == address(0)) revert BadConfig();
+        (, int256 answer,,,) = _ethUsdFeed.latestRoundData();
+        if (answer <= 0) revert BadConfig();
 
-    constructor(IPoolManager _poolManager) {
-        require(LP_BPS + SWAPPER_REBATE_BPS == BPS_DENOMINATOR, "bad split");
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
-        poolManager = _poolManager;
+
+        poolManager     = _poolManager;
+        treasury        = _treasury;
+        ethUsdFeed      = _ethUsdFeed;
+        payoutThreshold = (PAYOUT_USD * 1e18) / uint256(answer);
     }
 
-    // View helpers
+    // Views
 
     /// @notice Fee (pips) for a given distance from the anchor. Always within [MIN_FEE, MAX_FEE].
     function feeForDeviation(uint256 deviation) public pure returns (uint24) {
         if (deviation <= CALM_TICKS) return MIN_FEE;
         if (deviation >= FULL_TICKS) return MAX_FEE;
-        return uint24(MIN_FEE + (uint256(MAX_FEE - MIN_FEE) * (deviation - CALM_TICKS)) / (FULL_TICKS - CALM_TICKS));
+        unchecked {
+            return uint24(MIN_FEE + (uint256(MAX_FEE - MIN_FEE) * (deviation - CALM_TICKS)) / (FULL_TICKS - CALM_TICKS));
+        }
+    }
+
+    /// @notice Fee for the current tick against the stored anchor, before any time-based update
+    function currentFee(PoolId id) external view returns (uint24) {
+        (, int24 tick,,) = poolManager.getSlot0(id);
+        return feeForDeviation(_deviation(tick, _states[id].anchorTick));
     }
 
     function getPoolState(PoolId id) external view returns (PoolState memory) {
         return _states[id];
     }
 
-    // Hook permissions
+    /// @notice Treasury share accrued in the hook and not paid out yet, wei
+    function accruedTreasury() external view returns (uint256) {
+        return poolManager.balanceOf(address(this), ETH_ID);
+    }
 
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -117,41 +153,33 @@ contract VolatilityGuardHookV8 is IHooks {
             afterSwap:                     true,
             beforeDonate:                  false,
             afterDonate:                   false,
-            beforeSwapReturnDelta:         false,
+            beforeSwapReturnDelta:         true,
             afterSwapReturnDelta:          true,
             afterAddLiquidityReturnDelta:  false,
             afterRemoveLiquidityReturnDelta: false
         });
     }
 
-    // Hook lifecycle
+    // Hook callbacks
 
-    /// @dev Static-fee pools ignore the hook's fee, which would bypass MAX_FEE
+    /// @dev Static-fee pools ignore the hook's fee, and the treasury share is only taken in ETH
     function beforeInitialize(address, PoolKey calldata key, uint160)
-        external view override onlyPoolManager returns (bytes4)
+        external view onlyPoolManager returns (bytes4)
     {
-        require(key.fee.isDynamicFee(), "dynamic fee only");
+        if (!key.fee.isDynamicFee() || !key.currency0.isAddressZero()) revert UnsupportedPool();
         return IHooks.beforeInitialize.selector;
     }
 
-    function afterInitialize(
-        address,
-        PoolKey calldata key,
-        uint160,
-        int24 tick
-    ) external override onlyPoolManager returns (bytes4) {
-        PoolState storage state = _states[key.toId()];
-        state.anchorTick       = tick;
-        state.lastAnchorUpdate = uint40(block.timestamp);
+    function afterInitialize(address, PoolKey calldata key, uint160, int24 tick)
+        external onlyPoolManager returns (bytes4)
+    {
+        _states[key.toId()] = PoolState(tick, uint40(block.timestamp));
         return IHooks.afterInitialize.selector;
     }
 
-    function beforeSwap(
-        address,
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata,
-        bytes calldata
-    ) external override onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
+        external onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24)
+    {
         PoolId poolId = key.toId();
         PoolState storage state = _states[poolId];
 
@@ -163,10 +191,22 @@ contract VolatilityGuardHookV8 is IHooks {
             tstore(PRE_FEE_SLOT, fee)
         }
 
+        // ETH (currency0) is the specified side: only here can the treasury share be taken in ETH
+        int128 treasuryTake;
+        if ((params.amountSpecified < 0) == params.zeroForOne) {
+            int256 s = params.amountSpecified;
+            uint256 amount = uint256(s < 0 ? -s : s);
+            uint256 t = (amount * _share(fee, TREASURY_BPS)) / PIPS_DENOMINATOR;
+            if (t != 0) {
+                poolManager.mint(address(this), ETH_ID, t);
+                treasuryTake = int128(int256(t));
+            }
+        }
+
         return (
             IHooks.beforeSwap.selector,
-            BeforeSwapDeltaLibrary.ZERO_DELTA,
-            _lpShare(fee) | LPFeeLibrary.OVERRIDE_FEE_FLAG
+            toBeforeSwapDelta(treasuryTake, 0),
+            _share(fee, LP_BPS) | LPFeeLibrary.OVERRIDE_FEE_FLAG
         );
     }
 
@@ -176,7 +216,7 @@ contract VolatilityGuardHookV8 is IHooks {
         IPoolManager.SwapParams calldata params,
         BalanceDelta delta,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4, int128) {
+    ) external onlyPoolManager returns (bytes4, int128) {
         PoolId poolId = key.toId();
 
         uint24 preFee;
@@ -185,16 +225,73 @@ contract VolatilityGuardHookV8 is IHooks {
         }
         uint24 totalFee = _totalFee(poolId, preFee);
 
-        // The hook can only take the unspecified currency
-        bool specifiedIsZero = (params.amountSpecified < 0) == params.zeroForOne;
-        int128 unspecified = specifiedIsZero ? delta.amount1() : delta.amount0();
+        // The hook can only take the unspecified currency here
+        bool ethSpecified = (params.amountSpecified < 0) == params.zeroForOne;
+        int128 unspecified = ethSpecified ? delta.amount1() : delta.amount0();
         uint256 base = uint256(uint128(unspecified < 0 ? -unspecified : unspecified));
 
-        uint256 charged = _distribute(key, specifiedIsZero, base, totalFee, preFee);
+        uint256 charged = _charge(key, ethSpecified, base, totalFee, preFee);
+        _maybePayout();
         return (IHooks.afterSwap.selector, int128(int256(charged)));
     }
 
     // Internal
+
+    /// @dev LP top-up for the swap's own price move and, when ETH is unspecified, the treasury share.
+    ///      Both come from the unspecified currency. Returns the total amount taken.
+    function _charge(PoolKey calldata key, bool ethSpecified, uint256 base, uint24 totalFee, uint24 preFee)
+        internal
+        returns (uint256)
+    {
+        PoolId poolId = key.toId();
+        // With ETH specified the treasury share was fixed in beforeSwap, so the LPs get the whole
+        // top-up. Otherwise they get their 90% of it and the treasury its 10% below.
+        uint256 topUp = ethSpecified
+            ? (base * (totalFee - preFee)) / PIPS_DENOMINATOR
+            : (base * (_share(totalFee, LP_BPS) - _share(preFee, LP_BPS))) / PIPS_DENOMINATOR;
+        // Donating to a pool with no active liquidity reverts
+        if (topUp != 0 && poolManager.getLiquidity(poolId) == 0) topUp = 0;
+        if (topUp != 0) {
+            ethSpecified ? poolManager.donate(key, 0, topUp, "") : poolManager.donate(key, topUp, 0, "");
+        }
+
+        uint256 t;
+        if (!ethSpecified) {
+            t = (base * _share(totalFee, TREASURY_BPS)) / PIPS_DENOMINATOR;
+            if (t != 0) poolManager.mint(address(this), ETH_ID, t);
+        }
+        return topUp + t;
+    }
+
+    /// @dev Pays all but 1 wei of the claims once they pass the threshold. Keeping 1 wei leaves the
+    ///      claims slot non-zero, so the next accrual is not charged a fresh storage write.
+    ///      Runs last in afterSwap: the transfer can run treasury code.
+    function _maybePayout() internal {
+        uint256 accrued = poolManager.balanceOf(address(this), ETH_ID);
+        if (accrued <= payoutThreshold) return;
+        uint256 amount;
+        unchecked { amount = accrued - 1; }
+
+        try poolManager.take(CurrencyLibrary.ADDRESS_ZERO, treasury, amount) {
+            poolManager.burn(address(this), ETH_ID, amount);
+        } catch {
+            return; // the treasury rejected ETH: keep accruing, swaps go on
+        }
+
+        uint256 next = payoutThreshold;
+        try ethUsdFeed.latestRoundData() returns (uint80, int256 answer, uint256, uint256, uint80) {
+            if (answer > 0) next = (PAYOUT_USD * 1e18) / uint256(answer);
+        } catch {}
+        payoutThreshold = next;
+        emit TreasuryPaid(amount, next);
+    }
+
+    /// @dev The higher of the fee charged before the swap and the fee for the post-swap tick
+    function _totalFee(PoolId poolId, uint24 preFee) internal view returns (uint24) {
+        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
+        uint24 postFee = feeForDeviation(_deviation(currentTick, _states[poolId].anchorTick));
+        return postFee > preFee ? postFee : preFee;
+    }
 
     /// @dev Moves the anchor towards the tick by the elapsed share of ANCHOR_PERIOD. Elapsed time
     ///      is kept until it produces a step, otherwise rounding would let dust swaps freeze the anchor.
@@ -212,81 +309,12 @@ contract VolatilityGuardHookV8 is IHooks {
         state.lastAnchorUpdate = uint40(block.timestamp);
     }
 
-    /// @dev The higher of the fee charged before the swap and the fee for the post-swap tick
-    function _totalFee(PoolId poolId, uint24 preFee) internal view returns (uint24) {
-        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
-        uint24 postFee = feeForDeviation(_deviation(currentTick, _states[poolId].anchorTick));
-        return postFee > preFee ? postFee : preFee;
-    }
-
-    /// @dev Takes the rebate and the LP top-up from the unspecified currency, returns the amount charged
-    function _distribute(PoolKey calldata key, bool specifiedIsZero, uint256 base, uint24 totalFee, uint24 preFee)
-        internal
-        returns (uint256)
-    {
-        PoolId poolId = key.toId();
-        Currency currency = specifiedIsZero ? key.currency1 : key.currency0;
-
-        uint256 rebateAmount = (base * _share(totalFee, SWAPPER_REBATE_BPS)) / PIPS_DENOMINATOR;
-        uint256 topUpAmount  = (base * (_lpShare(totalFee) - _lpShare(preFee))) / PIPS_DENOMINATOR;
-
-        // Donating to a pool with no active liquidity reverts
-        if (topUpAmount != 0 && poolManager.getLiquidity(poolId) == 0) topUpAmount = 0;
-
-        if (topUpAmount != 0) {
-            specifiedIsZero
-                ? poolManager.donate(key, 0, topUpAmount, "")
-                : poolManager.donate(key, topUpAmount, 0, "");
-        }
-        // Last, after all state changes: this call can run code at tx.origin
-        if (rebateAmount != 0) {
-            try poolManager.take(currency, tx.origin, rebateAmount) {
-                emit SwapperRebate(tx.origin, currency, rebateAmount);
-            } catch {
-                rebateAmount = 0; // not charged, the swapper keeps it
-            }
-        }
-
-        emit FeeCharged(poolId, totalFee, rebateAmount, topUpAmount);
-        return rebateAmount + topUpAmount;
-    }
-
     function _deviation(int24 tick, int24 anchor) internal pure returns (uint256) {
         int256 gap = int256(tick) - int256(anchor);
         return uint256(gap < 0 ? -gap : gap);
     }
 
-    function _lpShare(uint24 fee) internal pure returns (uint24) {
-        return _share(fee, LP_BPS);
-    }
-
     function _share(uint24 fee, uint256 bps) internal pure returns (uint24) {
-        return uint24((uint256(fee) * bps) / BPS_DENOMINATOR);
+        unchecked { return uint24((uint256(fee) * bps) / BPS_DENOMINATOR); }
     }
-
-    // IHooks stubs
-
-    function beforeAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
-        external view override onlyPoolManager returns (bytes4)
-    { return IHooks.beforeAddLiquidity.selector; }
-
-    function afterAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata)
-        external view override onlyPoolManager returns (bytes4, BalanceDelta)
-    { return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0)); }
-
-    function beforeRemoveLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
-        external view override onlyPoolManager returns (bytes4)
-    { return IHooks.beforeRemoveLiquidity.selector; }
-
-    function afterRemoveLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata)
-        external view override onlyPoolManager returns (bytes4, BalanceDelta)
-    { return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0)); }
-
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        external view override onlyPoolManager returns (bytes4)
-    { return IHooks.beforeDonate.selector; }
-
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        external view override onlyPoolManager returns (bytes4)
-    { return IHooks.afterDonate.selector; }
 }
