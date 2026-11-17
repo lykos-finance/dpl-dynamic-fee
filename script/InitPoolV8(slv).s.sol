@@ -106,9 +106,9 @@ contract InitPoolV8 is Script {
 
     function _planPosition() internal view returns (Position memory p) {
         // ── Ликвидность на каждую сторону в USDC (6 знаков), диапазон в % от текущей цены ETH ──
-        uint256 usdcAmount = vm.envOr("LP_USDC_PER_SIDE", uint256(2_500_000)); // $2.50
+        uint256 usdcAmount = vm.envOr("LP_USDC_PER_SIDE", uint256(20_000_000)); // $20
         uint256 rangeBelow = vm.envOr("LP_RANGE_BELOW_PCT", uint256(50));
-        uint256 rangeAbove = vm.envOr("LP_RANGE_ABOVE_PCT", uint256(50));
+        uint256 rangeAbove = vm.envOr("LP_RANGE_ABOVE_PCT", uint256(100));
         require(usdcAmount > 0, "Zero liquidity");
         require(rangeBelow > 0 && rangeBelow < 100 && rangeAbove > 0, "Bad range");
 

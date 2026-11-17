@@ -28,6 +28,7 @@ A Uniswap v4 hook for pools of native ETH against any token on Ethereum mainnet.
 | `script/DeployV8(slv).s.sol` | Deploys the factory and the hook |
 | `script/InitPoolV8(slv).s.sol` | Creates the ETH/USDC pool and the first position |
 | `script/InitPoolV8Token(slv).s.sol` | Creates an ETH/token pool, for example ETH/VJDX |
+| `script/SwapV8(slv).s.sol` | Buys (`BuyV8`) or sells (`SellV8`) the token in a pool with the hook |
 | `test/VolatilityGuardHookV8.t.sol` | Unit tests |
 | `test/VolatilityGuardHookV8Fork.t.sol` | Full flow on a mainnet fork |
 
@@ -72,9 +73,9 @@ TREASURY=0x...             # receives the 10% in ETH. Defaults to the deployer. 
 HOOK_ADDRESS_V8=0x...
 
 # Optional
-LP_USDC_PER_SIDE=2500000   # USDC per side, 6 decimals. Defaults to $2.50
+LP_USDC_PER_SIDE=20000000  # USDC per side, 6 decimals. Defaults to $20
 LP_RANGE_BELOW_PCT=50      # range around the current ETH price, %
-LP_RANGE_ABOVE_PCT=50
+LP_RANGE_ABOVE_PCT=100     # -50% / +100% (0.5x..2x) puts equal value on both sides
 ```
 
 ## Deployment
@@ -119,9 +120,25 @@ forge script "script/InitPoolV8Token(slv).s.sol:InitPoolV8Token" --rpc-url "$MAI
 
 Tokens with a transfer fee or a rebasing balance do not work with Uniswap v4 accounting: the simulation then fails. The fork test checks the real VJDX contract: no transfer fee, pool creation and swaps both ways.
 
+## Buying and selling
+
+`script/SwapV8(slv).s.sol` swaps an exact input amount in a native ETH pool with the hook through the Uniswap Universal Router. `BuyV8` pays ETH for the token, `SellV8` sells the token for ETH. The minimum output is the V4 Quoter's quote minus `SWAP_SLIPPAGE_BPS`; the quote runs the hook, so it already includes the dynamic fee. `SellV8` approves the token to Permit2 and gives the router a Permit2 allowance for this amount only, valid for 5 minutes.
+
+```bash
+SWAP_TOKEN=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48   # USDC (the default); or the VJDX address
+SWAP_AMOUNT=$(cast to-wei 0.001)    # BuyV8: ETH in wei. SellV8: token units, e.g. 1000000 = 1 USDC
+SWAP_SLIPPAGE_BPS=100               # 1% against the quote
+```
+
+```bash
+forge script "script/SwapV8(slv).s.sol:BuyV8"  --rpc-url "$MAINNET_RPC_URL"               # simulate
+forge script "script/SwapV8(slv).s.sol:BuyV8"  --rpc-url "$MAINNET_RPC_URL" --broadcast
+forge script "script/SwapV8(slv).s.sol:SellV8" --rpc-url "$MAINNET_RPC_URL" --broadcast
+```
+
 ## Liquidity depth
 
-The fee depends on how far a swap itself moves the price, so with thin liquidity almost every swap pays a lot. On a fork, a $1,000 swap into a USDC/WETH pool with $100,000 per side and a ±50% range paid about 0.44%. The ETH/USDC pool has not been measured. With the default settings ($2.50 per side), even a small swap pays about 2%. Choose the amount and range before launch.
+The fee depends on how far a swap itself moves the price, so with thin liquidity almost every swap pays a lot. On a fork, a $1,000 swap into a USDC/WETH pool with $100,000 per side and a ±50% range paid about 0.44%. The ETH/USDC pool has not been measured. With the default settings ($20 per side), even a small swap pays about 2%. Choose the amount and range before launch.
 
 ## Withdrawing liquidity
 
