@@ -19,6 +19,9 @@ contract DeployV9 is Script {
     address constant POOL_MANAGER      = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address constant CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
+    /// @dev Pools against WETH (either side) are allowed, created by the initializer only
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
     // Tokens
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
@@ -57,6 +60,23 @@ contract DeployV9 is Script {
         c[7] = VolatilityGuardHookV9.OracleConfig(WBTC, WBTC_BTC, DAY_FEED, BTC_USD, HOUR_FEED, true);
     }
 
+    // Base (calm) fees in pips. Any other token pays the hook's DEFAULT_BASE_FEE (1%).
+    // More tokens can be added later by the initializer (setBaseFee); a set fee never changes.
+    uint24 constant MAJOR_FEE = 500;   // 0.05%
+    uint24 constant DEFI_FEE  = 2_500; // 0.25%
+
+    function feeList() public pure returns (VolatilityGuardHookV9.TokenFee[] memory f) {
+        f = new VolatilityGuardHookV9.TokenFee[](8);
+        f[0] = VolatilityGuardHookV9.TokenFee(USDC, MAJOR_FEE);
+        f[1] = VolatilityGuardHookV9.TokenFee(USDT, MAJOR_FEE);
+        f[2] = VolatilityGuardHookV9.TokenFee(DAI,  MAJOR_FEE);
+        f[3] = VolatilityGuardHookV9.TokenFee(WBTC, MAJOR_FEE);
+        f[4] = VolatilityGuardHookV9.TokenFee(LINK, DEFI_FEE);
+        f[5] = VolatilityGuardHookV9.TokenFee(UNI,  DEFI_FEE);
+        f[6] = VolatilityGuardHookV9.TokenFee(AAVE, DEFI_FEE);
+        f[7] = VolatilityGuardHookV9.TokenFee(SHIB, DEFI_FEE);
+    }
+
     function run() external {
         uint256 pk          = vm.envUint("PRIVATE_KEY");
         address deployer    = vm.addr(pk);
@@ -81,7 +101,8 @@ contract DeployV9 is Script {
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
                 | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
-        bytes memory args = abi.encode(POOL_MANAGER, treasury, CHAINLINK_ETH_USD, initializer, oracleList());
+        bytes memory args =
+            abi.encode(POOL_MANAGER, treasury, CHAINLINK_ETH_USD, initializer, oracleList(), feeList(), WETH);
         (address predicted, bytes32 salt) =
             HookMiner.find(address(factory), flags, type(VolatilityGuardHookV9).creationCode, args);
         require(uint160(predicted) & uint160(0x3FFF) == flags, "Wrong flags");
